@@ -28,13 +28,19 @@
  */
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Net;
 using System.Reflection;
 using log4net;
 using Mono.Addins;
 using Nini.Config;
+using Nwc.XmlRpc;
 using OpenMetaverse;
+using OpenMetaverse.StructuredData;
 using OpenSim.Framework;
+using OpenSim.Framework.Servers;
+using OpenSim.Framework.Servers.HttpServer;
 using OpenSim.Region.Framework;
 using OpenSim.Region.Framework.Interfaces;
 using OpenSim.Region.Framework.Scenes;
@@ -54,6 +60,8 @@ namespace OpenSim.Addons.SynEconomy
         private SynEconomyStore m_store;
         private string m_currencySymbol = "L$";
         private IConfigSource m_gConfig;
+        private string m_localEconomyURL;
+        private Dictionary<string, XmlRpcMethod> m_rpcHandlers;
 
         private readonly Dictionary<ulong, Scene> m_scenes = new Dictionary<ulong, Scene>();
 
@@ -114,6 +122,25 @@ namespace OpenSim.Addons.SynEconomy
                     m_scenes[scene.RegionInfo.RegionHandle] = scene;
             }
 
+            // Register dummy XML-RPC economy handlers (once, on first region)
+            lock (m_scenes)
+            {
+                if (m_scenes.Count == 1)
+                {
+                    m_localEconomyURL = scene.RegionInfo.ServerURI;
+                    m_rpcHandlers = new Dictionary<string, XmlRpcMethod>();
+                    m_rpcHandlers.Add("getCurrencyQuote", DummyQuote);
+                    m_rpcHandlers.Add("buyCurrency", DummyBuyCurrency);
+                    m_rpcHandlers.Add("preflightBuyLandPrep", DummyPreflightBuyLand);
+                    m_rpcHandlers.Add("buyLandPrep", DummyLandBuy);
+
+                    MainServer.Instance.AddSimpleStreamHandler(
+                        new SimpleStreamHandler("/currency.php", HandlePHP));
+                    MainServer.Instance.AddSimpleStreamHandler(
+                        new SimpleStreamHandler("/landtool.php", HandlePHP));
+                }
+            }
+
             scene.EventManager.OnNewClient += OnNewClient;
             scene.EventManager.OnClientClosed += OnClientClosed;
             scene.EventManager.OnMoneyTransfer += OnMoneyTransferEvent;
@@ -144,7 +171,19 @@ namespace OpenSim.Addons.SynEconomy
             scene.EventManager.OnSetRootAgentScene -= OnSetRootAgentScene;
         }
 
-        public void RegionLoaded(Scene scene) { }
+        public void RegionLoaded(Scene scene)
+        {
+            if (!m_enabled) return;
+            if (scene.SceneGridInfo != null && !string.IsNullOrEmpty(scene.SceneGridInfo.EconomyURL))
+                return;
+            ISimulatorFeaturesModule fm = scene.RequestModuleInterface<ISimulatorFeaturesModule>();
+            if (fm != null && !string.IsNullOrWhiteSpace(m_localEconomyURL))
+            {
+                if (fm.TryGetOpenSimExtraFeature("currency-base-uri", out OSD tmp))
+                    return;
+                fm.AddOpenSimExtraFeature("currency-base-uri", Util.AppendEndSlash(m_localEconomyURL));
+            }
+        }
 
         public void PostInitialise()
         {
@@ -585,6 +624,80 @@ namespace OpenSim.Addons.SynEconomy
 
         #endregion
 
+        #region Dummy XML-RPC economy handlers (required by viewer Buy Land floater)
+
+        private void HandlePHP(IOSHttpRequest request, IOSHttpResponse response)
+        {
+            MainServer.Instance.HandleXmlRpcRequests((OSHttpRequest)request, (OSHttpResponse)response, m_rpcHandlers);
+        }
+
+        private XmlRpcResponse DummyQuote(XmlRpcRequest request, IPEndPoint remoteClient)
+        {
+            int amount = 0;
+            try
+            {
+                Hashtable requestData = (Hashtable)request.Params[0];
+                amount = (int)requestData["currencyBuy"];
+            }
+            catch { }
+
+            Hashtable currencyResponse = new()
+            {
+                { "estimatedCost", 0 },
+                { "currencyBuy", amount }
+            };
+            Hashtable quoteResponse = new()
+            {
+                { "success", true },
+                { "currency", currencyResponse },
+                { "confirm", "asdfad9fj39ma9fj" }
+            };
+            return new XmlRpcResponse { Value = quoteResponse };
+        }
+
+        private XmlRpcResponse DummyBuyCurrency(XmlRpcRequest request, IPEndPoint remoteClient)
+        {
+            return new XmlRpcResponse
+            {
+                Value = new Hashtable { { "success", true } }
+            };
+        }
+
+        private XmlRpcResponse DummyPreflightBuyLand(XmlRpcRequest request, IPEndPoint remoteClient)
+        {
+            Hashtable landuse = new()
+            {
+                { "upgrade", false },
+                { "action", "http://invaliddomaininvalid.com/" }
+            };
+            Hashtable currency = new() { { "estimatedCost", 0 } };
+            Hashtable membership = new()
+            {
+                { "upgrade", false },
+                { "action", "http://invaliddomaininvalid.com/" },
+                { "levels", new Hashtable { { "upgrade", false }, { "action", "http://invaliddomaininvalid.com/" } } }
+            };
+            Hashtable retparam = new()
+            {
+                { "success", true },
+                { "currency", currency },
+                { "membership", membership },
+                { "landuse", landuse },
+                { "confirm", "asdfajsdkfjasdkfjalsdfjasdf" }
+            };
+            return new XmlRpcResponse { Value = retparam };
+        }
+
+        private XmlRpcResponse DummyLandBuy(XmlRpcRequest request, IPEndPoint remoteClient)
+        {
+            return new XmlRpcResponse
+            {
+                Value = new Hashtable { { "success", true } }
+            };
+        }
+
+        #endregion
+
         #region Console commands
 
         private void RegisterConsoleCommands()
@@ -784,17 +897,20 @@ namespace OpenSim.Addons.SynEconomy
             if (parts.Length == 2)
             {
                 Scene scene = GetAnyScene();
-                if (scene == null || scene.UserAccountService == null)
+                if (scene == null) return false;
+                IUserManagement um = scene.RequestModuleInterface<IUserManagement>();
+                if (um != null)
                 {
-                    m_log.Warn("[SYN ECONOMY]: No scene/UserAccountService available for name lookup");
-                    return false;
+                    UUID foundId = um.GetUserIdByName(parts[0], parts[1]);
+                    if (foundId != UUID.Zero)
+                    {
+                        id = foundId;
+                        display = parts[0] + " " + parts[1];
+                        return true;
+                    }
                 }
-                UserAccount acct = scene.UserAccountService.GetUserAccount(
-                    scene.RegionInfo.ScopeID, parts[0], parts[1]);
-                if (acct == null) return false;
-                id = acct.PrincipalID;
-                display = string.Format("{0} {1}", acct.FirstName, acct.LastName);
-                return true;
+                m_log.WarnFormat("[SYN ECONOMY]: No such avatar: {0}", query);
+                return false;
             }
             return false;
         }
@@ -802,12 +918,15 @@ namespace OpenSim.Addons.SynEconomy
         private string ResolveName(UUID id)
         {
             Scene scene = GetAnyScene();
-            if (scene == null || scene.UserAccountService == null) return id.ToString();
-            UserAccount acct = scene.UserAccountService.GetUserAccount(
-                scene.RegionInfo.ScopeID, id);
-            return acct != null
-                ? string.Format("{0} {1}", acct.FirstName, acct.LastName)
-                : id.ToString();
+            if (scene == null) return id.ToString();
+            IUserManagement um = scene.RequestModuleInterface<IUserManagement>();
+            if (um != null)
+            {
+                string name = um.GetUserName(id);
+                if (!string.IsNullOrEmpty(name))
+                    return name;
+            }
+            return id.ToString();
         }
 
         private Scene GetAnyScene()
